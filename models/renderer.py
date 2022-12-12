@@ -33,7 +33,7 @@ def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
     b_min_np = bound_min.detach().cpu().numpy()
 
     vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
-    return vertices, triangles
+    return vertices, triangles, u
 
 
 def sample_pdf(bins, weights, n_samples, det=False):
