@@ -15,7 +15,29 @@ from pyhocon import ConfigFactory
 from models.dataset import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
+from models.plenoxel.model import Plenoxel 
 
+
+N_PLENOXEL_PARAMS = 84
+
+class MetaOptim(torch.optim.Optimizer):
+
+    def __init__(self, params, defaults, lr=0.01):
+        super(MetaOptim, self).__init__(params, defaults)
+        other_params = self.params[N_PLENOXEL_PARAMS:]
+        self.adam = torch.optim.Adam(other_params, lr=lr)
+
+    def step(self, closure):            
+        self.optimizer.zero_grad()
+        loss = None
+        # Note: Calling closure mutates the plenoxel params and computes
+        # the loss.
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        loss.backward()
+        self.adam.step()  # Only changes the non-plenoxel parameters.
+        return loss
 
 class Runner:
     def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
@@ -58,17 +80,25 @@ class Runner:
         self.writer = None
 
         # Networks
-        params_to_train = []
-        self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device)
+        #self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device) # replace with plenoxel
+        self.plenoxel = Plenoxel(**self.conf['model.plenoxel']).to(self.device)
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
-        params_to_train += list(self.nerf_outside.parameters())
+
+        params_to_train = list(self.pleanoxel.parameters())
+        assert len(params_to_train) == N_PLENOXEL_PARAMS, "Update MetaOptim with correct param amount!"
         params_to_train += list(self.sdf_network.parameters())
         params_to_train += list(self.deviation_network.parameters())
         params_to_train += list(self.color_network.parameters())
-
-        self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
+        self.optimizer = MetaOptim(
+            params_to_train, 
+            {},
+            lr = self.learning_rate
+        )
+        # note need to run plenoxel optim for plenoxel and adam for sdf, so need to write meta optimizer that does both
+        #self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
+        #self.optimizer = PlenoxelOptim(self.parameters(), {})
 
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
@@ -76,6 +106,8 @@ class Runner:
                                      self.color_network,
                                      **self.conf['model.neus_renderer'])
 
+ 
+        # TODO: Port plenoxel checkpoint loading code.
         # Load checkpoint
         latest_model_name = None
         if is_continue:
@@ -100,60 +132,162 @@ class Runner:
         self.update_learning_rate()
         res_step = self.end_iter - self.iter_step
         image_perm = self.get_image_perm()
+        self.plenoxel.setup()
 
         for iter_i in tqdm(range(res_step)):
-            data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
+            def closure(): # from plenoxels
+                # from plenoxels TODO: add in these parameters
+                if self.lr_fg_begin_step > 0 and gstep == self.lr_fg_begin_step:
+                    self.model.density_data.data[:] = self.init_sigma
 
-            rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
-            near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+                data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
-            background_rgb = None
-            if self.use_white_bkgd:
-                background_rgb = torch.ones([1, 3])
+                # true_rgb = target for plenoxels
+                rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+                near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+                rays = dataclass.Rays(rays_o.contiguous(), rays_d.contiguous()) # added from plenoxels
 
-            if self.mask_weight > 0.0:
-                mask = (mask > 0.5).float()
-            else:
-                mask = torch.ones_like(mask)
+                background_rgb = None
+                if self.use_white_bkgd:
+                    background_rgb = torch.ones([1, 3])
 
-            mask_sum = mask.sum() + 1e-5
-            render_out = self.renderer.render(rays_o, rays_d, near, far,
-                                              background_rgb=background_rgb,
-                                              cos_anneal_ratio=self.get_cos_anneal_ratio())
+                if self.mask_weight > 0.0:
+                    mask = (mask > 0.5).float()
+                else:
+                    mask = torch.ones_like(mask)
 
-            color_fine = render_out['color_fine']
-            s_val = render_out['s_val']
-            cdf_fine = render_out['cdf_fine']
-            gradient_error = render_out['gradient_error']
-            weight_max = render_out['weight_max']
-            weight_sum = render_out['weight_sum']
+                mask_sum = mask.sum() + 1e-5
 
-            # Loss
-            color_error = (color_fine - true_rgb) * mask
-            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
-            psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
+                rgb = self.model.volume_render_fused(
+                    rays,
+                    true_rgb,
+                    beta_loss=self.lambda_beta,
+                    sparsity_loss=self.lambda_sparsity,
+                    randomize=self.enable_random,
+                ) # added from plenoxels
 
-            eikonal_loss = gradient_error
+                render_out = self.renderer.render(rays_o, rays_d, near, far,
+                                                background_rgb=background_rgb,
+                                                cos_anneal_ratio=self.get_cos_anneal_ratio())
 
-            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+                # TODO: check if rgb has all of these...
+                color_fine = render_out['color_fine']
+                s_val = render_out['s_val']
+                cdf_fine = render_out['cdf_fine']
+                gradient_error = render_out['gradient_error']
+                weight_max = render_out['weight_max']
+                weight_sum = render_out['weight_sum']
 
-            loss = color_fine_loss +\
-                   eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight
+                # Loss
+                # color_error = (color_fine - true_rgb) * mask
+                # color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
+                # psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
+                
+                img_loss = utils.img2mse(rgb, target) # from plenoxels
+                psnr = utils.mse2psnr(img_loss) # from plenoxels
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+                eikonal_loss = gradient_error
+
+                mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+
+                # loss = color_fine_loss +\
+                #        eikonal_loss * self.igr_weight +\
+                #        mask_loss * self.mask_weight
+
+                loss = img_loss +\
+                    eikonal_loss * self.igr_weight +\
+                    mask_loss * self.mask_weight
+
+                # update gradients from plenoxel
+                if self.lambda_tv > 0.0:
+                    self.model.inplace_tv_grad(
+                        self.model.density_data.grad,
+                        scaling=self.lambda_tv,
+                        sparse_frac=self.tv_sparsity,
+                        logalpha=self.tv_logalpha,
+                        ndc_coeffs=self.ndc_coeffs,
+                        contiguous=self.tv_contiguous,
+                    )
+
+                if self.lambda_tv_sh > 0.0:
+                    self.model.inplace_tv_color_grad(
+                        self.model.sh_data.grad,
+                        scaling=self.lambda_tv_sh,
+                        sparse_frac=self.tv_sh_sparsity,
+                        ndc_coeffs=self.ndc_coeffs,
+                        contiguous=self.tv_contiguous,
+                    )
+
+                if self.lambda_tv_lumisphere > 0.0:
+                    self.model.inplace_tv_lumisphere_grad(
+                        self.model.sh_data.grad,
+                        scaling=self.lambda_tv_lumisphere,
+                        dir_factor=self.tv_lumisphere_dir_factor,
+                        sparse_frac=self.tv_lumisphere_sparsity,
+                        ndc_coeffs=self.ndc_coeffs,
+                    )
+
+                if self.lambda_l2_sh > 0.0:
+                    self.model.inplace_l2_color_grad(
+                        self.model.sh_data.grad, scaling=self.lambda_l2_sh
+                    )
+
+                if self.model.use_background and (
+                    self.lambda_tv_background_sigma > 0.0
+                    or self.lambda_tv_background_color > 0.0
+                ):
+                    self.model.inplace_tv_background_grad(
+                        self.model.background_data.grad,
+                        scaling=self.lambda_tv_background_color,
+                        scaling_density=self.lambda_tv_background_sigma,
+                        sparse_frac=self.tv_background_sparsity,
+                        contiguous=self.tv_contiguous,
+                    )
+
+                # Save statistics
+                 self.writer.add_scalar('Loss/loss', loss, self.iter_step)
+                #self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
+                self.writer.add_scalar('Loss/color_loss', img_loss, self.iter_step)
+                self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+                self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
+                self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
+                self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
+                self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
+                return loss
+            
+            #### PLENOXELS ####
+            self.optimizers().step(closure)
+    
+            gstep = self.iter_step
+            #gstep = self.global_step
+            lr_sigma = self.lr_sigma_func(gstep)
+            lr_sh = self.lr_sh_func(gstep)
+            lr_sigma_bg = self.lr_sigma_bg_func(gstep - self.lr_basis_begin_step)
+            lr_color_bg = self.lr_color_bg_func(gstep - self.lr_basis_begin_step)
+
+            if gstep >= self.lr_fg_begin_step:
+                self.model.optim_density_step(
+                    lr_sigma, beta=self.rms_beta, optim=self.sigma_optim
+                )
+                self.model.optim_sh_step(lr_sh, beta=self.rms_beta, optim=self.sh_optim)
+
+            if self.model.use_background:
+                self.model.optim_background_step(
+                    lr_sigma_bg, lr_color_bg, beta=self.rms_beta, optim=self.bg_optim
+                )
+
+            if self.weight_decay_sh < 1.0 and gstep % 20 == 0:
+                self.model.sh_data.data *= self.weight_decay_sigma
+            if self.weight_decay_sigma < 1.0 and gstep % 20 == 0:
+                self.model.density_data.data *= self.weight_decay_sh
+
+            #### END PLENOXELS ####
+
+            # self.optimizer.zero_grad()
+            # loss.backward()
+            # self.optimizer.step()
 
             self.iter_step += 1
-
-            self.writer.add_scalar('Loss/loss', loss, self.iter_step)
-            self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
-            self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
-            self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
-            self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
-            self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
-            self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
 
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
