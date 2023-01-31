@@ -203,6 +203,7 @@ class NeuSRenderer:
                     background_sampled_color=None,
                     background_rgb=None,
                     cos_anneal_ratio=0.0):
+        
         batch_size, n_samples = z_vals.shape
 
         # Section length
@@ -211,18 +212,26 @@ class NeuSRenderer:
         mid_z_vals = z_vals + dists * 0.5
 
         # Section midpoints
-        pts = rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]  # n_rays, n_samples, 3
-        dirs = rays_d[:, None, :].expand(pts.shape)
+        sdf_pts = rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]  # n_rays, n_samples, 3
+        dis_to_center = torch.linalg.norm(sdf_pts, ord=2, dim=-1, keepdim=True).clip(1.0, 1e10)
+        pts = torch.cat([sdf_pts / dis_to_center, 1.0 / dis_to_center], dim=-1)       # batch_size, n_samples, 4
+        dirs = rays_d[:, None, :].expand(batch_size, n_samples, 3)
+        #dirs = rays_d[:, None, :].expand(pts.shape)
 
-        pts = pts.reshape(-1, 3)
+        sdf_pts = sdf_pts.reshape(-1, 3)
+        #pts = pts.reshape(-1, 3 + int(self.n_outside > 0))
+        pts = pts.reshape(-1, 4) # TODO: check on this hard-coding
         dirs = dirs.reshape(-1, 3)
 
-        sdf_nn_output = sdf_network(pts)
+        sdf_nn_output = sdf_network(sdf_pts)
         sdf = sdf_nn_output[:, :1]
-        feature_vector = sdf_nn_output[:, 1:]
+        #feature_vector = sdf_nn_output[:, 1:]
 
-        gradients = sdf_network.gradient(pts).squeeze()
-        sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+        gradients = sdf_network.gradient(sdf_pts).squeeze()
+        #sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+        density, sampled_color = self.nerf(pts, dirs)
+        sampled_color = torch.sigmoid(sampled_color)
+        sampled_color = sampled_color.reshape(batch_size, n_samples, 3)
 
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
@@ -244,7 +253,11 @@ class NeuSRenderer:
         p = prev_cdf - next_cdf
         c = prev_cdf
 
-        alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
+        neus_alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
+        # add nerf alpha
+        nerf_alpha = 1.0 - torch.exp(-F.softplus(density.reshape(batch_size, n_samples)) * dists)
+        nerf_alpha = nerf_alpha.reshape(batch_size, n_samples)
+        
 
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
         inside_sphere = (pts_norm < 1.0).float().detach()
@@ -252,16 +265,21 @@ class NeuSRenderer:
 
         # Render with background
         if background_alpha is not None:
-            alpha = alpha * inside_sphere + background_alpha[:, :n_samples] * (1.0 - inside_sphere)
-            alpha = torch.cat([alpha, background_alpha[:, n_samples:]], dim=-1)
+            # update neus alpha
+            neus_alpha = neus_alpha * inside_sphere + background_alpha[:, :n_samples] * (1.0 - inside_sphere)
+            neus_alpha = torch.cat([neus_alpha, background_alpha[:, n_samples:]], dim=-1)
+            # update nerf alpha
+            nerf_alpha = nerf_alpha * inside_sphere + background_alpha[:, :n_samples] * (1.0 - inside_sphere)
+            nerf_alpha = torch.cat([nerf_alpha, background_alpha[:, n_samples:]], dim=-1)
+            # update color with background
             sampled_color = sampled_color * inside_sphere[:, :, None] +\
                             background_sampled_color[:, :n_samples] * (1.0 - inside_sphere)[:, :, None]
             sampled_color = torch.cat([sampled_color, background_sampled_color[:, n_samples:]], dim=1)
 
-        weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
+        weights = nerf_alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - nerf_alpha + 1e-7], -1), -1)[:, :-1]
         weights_sum = weights.sum(dim=-1, keepdim=True)
-
-        color = (sampled_color * weights[:, :, None]).sum(dim=1)
+        #color = (sampled_color * weights[:, :, None]).sum(dim=1)
+        color = (weights[:, :, None] * sampled_color).sum(dim=1)
         if background_rgb is not None:    # Fixed background, usually black
             color = color + background_rgb * (1.0 - weights_sum)
 
@@ -280,7 +298,9 @@ class NeuSRenderer:
             'weights': weights,
             'cdf': c.reshape(batch_size, n_samples),
             'gradient_error': gradient_error,
-            'inside_sphere': inside_sphere
+            'inside_sphere': inside_sphere,
+            'nerf_alpha': nerf_alpha,
+            'neus_alpha': neus_alpha
         }
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
@@ -374,7 +394,9 @@ class NeuSRenderer:
             'gradients': gradients,
             'weights': weights,
             'gradient_error': ret_fine['gradient_error'],
-            'inside_sphere': ret_fine['inside_sphere']
+            'inside_sphere': ret_fine['inside_sphere'],
+            'nerf_alpha': ret_fine['nerf_alpha'],
+            'neus_alpha': ret_fine['neus_alpha']
         }
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):

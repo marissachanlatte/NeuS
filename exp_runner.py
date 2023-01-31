@@ -127,6 +127,8 @@ class Runner:
             gradient_error = render_out['gradient_error']
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
+            neus_alpha = render_out['neus_alpha']
+            nerf_alpha = render_out['nerf_alpha']
 
             # Loss
             color_error = (color_fine - true_rgb) * mask
@@ -137,9 +139,11 @@ class Runner:
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
 
+            alpha_loss = F.mse_loss(neus_alpha, nerf_alpha)
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight
+                   mask_loss * self.mask_weight +\
+                   alpha_loss     
 
             self.optimizer.zero_grad()
             loss.backward()

@@ -193,7 +193,7 @@ class NeRF(nn.Module):
         self.input_ch_view = 3
         self.embed_fn = None
         self.embed_fn_view = None
-
+        
         if multires > 0:
             embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
             self.embed_fn = embed_fn
@@ -229,6 +229,7 @@ class NeRF(nn.Module):
     def forward(self, input_pts, input_views):
         if self.embed_fn is not None:
             input_pts = self.embed_fn(input_pts)
+
         if self.embed_fn_view is not None:
             input_views = self.embed_fn_view(input_views)
 
