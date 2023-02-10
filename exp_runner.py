@@ -129,7 +129,7 @@ class Runner:
             weight_sum = render_out['weight_sum']
             neus_alpha = render_out['neus_alpha']
             nerf_alpha = render_out['nerf_alpha']
-
+            
             # Loss
             color_error = (color_fine - true_rgb) * mask
             color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
@@ -140,11 +140,15 @@ class Runner:
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
 
             alpha_loss = F.mse_loss(neus_alpha, nerf_alpha)
+            alpha_weight = 10
+
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
                    mask_loss * self.mask_weight +\
-                   alpha_loss     
+                   alpha_loss  * alpha_weight   
 
+            if self.iter_step % 100 == 0:
+                print("Loss: ", "color -", str(color_fine_loss), ", sdf -", str(eikonal_loss * self.igr_weight), ", alpha - ", str(alpha_loss  * alpha_weight))
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
@@ -284,7 +288,7 @@ class Runner:
             rot = np.linalg.inv(self.dataset.pose_all[idx, :3, :3].detach().cpu().numpy())
             normal_img = (np.matmul(rot[None, :, :], normal_img[:, :, None])
                           .reshape([H, W, 3, -1]) * 128 + 128).clip(0, 255)
-
+        
         os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
 

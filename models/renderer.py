@@ -259,9 +259,9 @@ class NeuSRenderer:
         nerf_alpha = nerf_alpha.reshape(batch_size, n_samples)
         
 
-        pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
-        inside_sphere = (pts_norm < 1.0).float().detach()
-        relax_inside_sphere = (pts_norm < 1.2).float().detach()
+        sdf_pts_norm = torch.linalg.norm(sdf_pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
+        inside_sphere = (sdf_pts_norm < 1.0).float().detach()
+        relax_inside_sphere = (sdf_pts_norm < 1.2).float().detach()
 
         # Render with background
         if background_alpha is not None:
