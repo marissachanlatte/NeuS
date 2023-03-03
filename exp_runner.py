@@ -13,7 +13,8 @@ from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
 from models.dataset import Dataset
-from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
+from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork
+from torch_ngp.nerf.network import NeRFNetwork
 from models.renderer import NeuSRenderer
 
 
@@ -59,7 +60,7 @@ class Runner:
 
         # Networks
         params_to_train = []
-        self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device)
+        self.nerf_outside = NeRFNetwork(**self.conf['model.nerf']).to(self.device)
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)

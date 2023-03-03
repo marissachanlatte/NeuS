@@ -228,8 +228,7 @@ class NeuSRenderer:
         #feature_vector = sdf_nn_output[:, 1:]
 
         gradients = sdf_network.gradient(sdf_pts).squeeze()
-        #sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
-        density, sampled_color = self.nerf(pts, dirs)
+        density, sampled_color = self.nerf(sdf_pts, dirs)
         sampled_color = torch.sigmoid(sampled_color)
         sampled_color = sampled_color.reshape(batch_size, n_samples, 3)
 
