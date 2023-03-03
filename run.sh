@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A m1411
+#SBATCH -A m1411_g
 #SBATCH -C gpu
 #SBATCH -q regular
 #SBATCH -t 12:00:00
@@ -13,4 +13,5 @@
 export SLURM_CPU_BIND="cores"
 source ~/.bashrc
 conda activate neus
-python exp_runner.py --mode train --conf ./confs/wmask.conf --case sphere_in_room_preprocessed
+#python exp_runner.py --mode train --conf ./confs/wmask.conf --case sphere_in_room_preprocessed
+python exp_runner.py --mode train --conf ./confs/wmask.conf --case thin_catbus

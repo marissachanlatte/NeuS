@@ -13,8 +13,10 @@ from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
 from models.dataset import Dataset
-from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
+from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork
 from models.renderer import NeuSRenderer
+from k_planes.models.kplane_field import KPlaneField
+from k_planes.ops.activations import init_density_activation
 
 
 class Runner:
@@ -59,18 +61,33 @@ class Runner:
 
         # Networks
         params_to_train = []
-        self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device)
+        #self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device)
+        # replace with k-plane
+        scene_bbox = torch.Tensor([[-2.0, -2.0, -2.0], [2.0, 2.0, 2.0]])
+        grid_config=[dict(grid_dimensions = 2,
+                      input_coordinate_dim = 3,
+                      output_coordinate_dim = 32,
+                      resolution = [64, 64, 64])]
+        
+        density_act = init_density_activation('trunc_exp')
+        self.k_plane = KPlaneField(scene_bbox, 
+                                   grid_config=grid_config, 
+                                   num_images = self.dataset.n_images, 
+                                   spatial_distortion=None,
+                                   density_activation=density_act, 
+                                   **self.conf['model.kplane']).to(self.device)
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
-        params_to_train += list(self.nerf_outside.parameters())
+        #params_to_train += list(self.nerf_outside.parameters())
+        params_to_train += list(self.k_plane.parameters())
         params_to_train += list(self.sdf_network.parameters())
         params_to_train += list(self.deviation_network.parameters())
         params_to_train += list(self.color_network.parameters())
 
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
 
-        self.renderer = NeuSRenderer(self.nerf_outside,
+        self.renderer = NeuSRenderer(self.k_plane,
                                      self.sdf_network,
                                      self.deviation_network,
                                      self.color_network,
@@ -128,7 +145,7 @@ class Runner:
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
             neus_alpha = render_out['neus_alpha']
-            nerf_alpha = render_out['nerf_alpha']
+            k_alpha = render_out['k_alpha']
 
             # Loss
             color_error = (color_fine - true_rgb) * mask
@@ -139,7 +156,7 @@ class Runner:
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
 
-            alpha_loss = F.mse_loss(neus_alpha, nerf_alpha)
+            alpha_loss = F.mse_loss(neus_alpha, k_alpha)
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
                    mask_loss * self.mask_weight +\
@@ -212,7 +229,8 @@ class Runner:
 
     def load_checkpoint(self, checkpoint_name):
         checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
-        self.nerf_outside.load_state_dict(checkpoint['nerf'])
+        #self.nerf_outside.load_state_dict(checkpoint['nerf'])
+        self.k_plane.load_state_dict(checkpoint['k_plane'])
         self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
         self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
         self.color_network.load_state_dict(checkpoint['color_network_fine'])
@@ -223,7 +241,7 @@ class Runner:
 
     def save_checkpoint(self):
         checkpoint = {
-            'nerf': self.nerf_outside.state_dict(),
+            'k_plane': self.k_plane.state_dict(),
             'sdf_network_fine': self.sdf_network.state_dict(),
             'variance_network_fine': self.deviation_network.state_dict(),
             'color_network_fine': self.color_network.state_dict(),
